@@ -1,14 +1,23 @@
+from pathlib import Path
+from dotenv import load_dotenv
+
+# loads backend/.env no matter where you run uvicorn from
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
 from .core import auth as auth_router
 from .routers import sets as sets_router
 from .routers import reviews as reviews_router
-from .routers import custom_collections as collections_router
+from .routers import collections as collections_router
 from .routers import lists as lists_router
 from .routers import users as users_router
+from .routers import feed as feed_router
+
 from .api import themes
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from .db import get_db
 
 app = FastAPI(title="LEGO API")
@@ -52,4 +61,9 @@ app.include_router(themes.router)
 
 @app.get("/db/ping")
 def db_ping(db: Session = Depends(get_db)):
-    return db.execute(text("select current_database() as db, current_user as user")).mappings().one()
+    row = db.execute(
+        text("select current_database() as db, current_user as user")
+    ).mappings().one()
+    return dict(row)
+
+app.include_router(feed_router.router, prefix="/feed", tags=["feed"])

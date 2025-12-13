@@ -1,382 +1,340 @@
-# app/routers/sets.py
+# backend/app/routers/sets.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
-from fastapi import APIRouter, HTTPException, Query, Response
 from difflib import SequenceMatcher
 
-from ..data.sets import load_cached_sets, get_set_by_num
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import case, desc, asc, func, or_, select
+from sqlalchemy.orm import Session
+
+from ..db import get_db
+from ..models import Set, Review  # matches your models.py
+
 from ..data.offers import get_offers_for_set
 from ..schemas.pricing import StoreOffer
 
 router = APIRouter()
 
-# --------- helpers ---------
-def _rating_stats_for_set(set_num: str) -> Tuple[float, int]:
-    """
-    Compute (avg_rating, count) for a set by set_num from the in-memory REVIEWS list,
-    if available. Returns (0.0, 0) if no reviews or if the reviews store isn’t present.
-    """
-    try:
-        from ..data.reviews import REVIEWS  # type: ignore
-    except Exception:
-        return (0.0, 0)
 
-    rows = [r for r in REVIEWS if (r.get("set_num") or "").lower() == set_num.lower()]
-    if not rows:
-        return (0.0, 0)
+def _model_to_dict(obj: Any) -> Dict[str, Any]:
+    return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}  # type: ignore
 
-    ratings = [
-        r.get("rating")
-        for r in rows
-        if isinstance(r.get("rating"), (int, float))
-    ]
-    if not ratings:
-        return (0.0, 0)
 
-    avg = sum(ratings) / len(ratings)
-    return (round(avg, 2), len(ratings))
+def _plain_expr():
+    # Postgres: split_part('10305-1','-',1) -> '10305'
+    return func.split_part(Set.set_num, "-", 1)
 
-def _similarity(a: str, b: str) -> float:
-    """Return similarity between two strings (0.0–1.0)."""
-    return SequenceMatcher(None, a, b).ratio()
 
-def _matches_query(s: Dict[str, Any], q: str) -> bool:
-    """Case-insensitive match against name, theme, set_num, set_num_plain."""
-    q = q.strip().lower()
-    if not q:
-        return True
-    name = (s.get("name") or "").lower()
-    theme = (s.get("theme") or "").lower()
-    set_num = (s.get("set_num") or "").lower()
-    plain = (s.get("set_num_plain") or "").lower()
-    return (q in name) or (q in theme) or (q in set_num) or (q == plain)
-
-def _fuzzy_score_for_set(s: Dict[str, Any], q: str) -> float:
-    """
-    Return a similarity score (0.0–1.0) between the query and
-    a set's name / ip / theme using difflib.SequenceMatcher.
-    Higher = more similar.
-    """
+def _fuzzy_score(row: Dict[str, Any], q: str) -> float:
     q = (q or "").strip().lower()
     if not q:
         return 0.0
 
     candidates = [
-        (s.get("name") or "").lower(),
-        (s.get("ip") or "").lower(),
-        (s.get("theme") or "").lower(),
+        (row.get("name") or "").lower(),
+        (row.get("theme") or "").lower(),
+        (row.get("set_num") or "").lower(),
     ]
-
     best = 0.0
-    for text in candidates:
-        if not text:
+    for t in candidates:
+        if not t:
             continue
-        ratio = SequenceMatcher(None, q, text).ratio()
-        if ratio > best:
-            best = ratio
+        best = max(best, SequenceMatcher(None, q, t).ratio())
     return best
 
-def _relevance_score(s: Dict[str, Any], q: str) -> int:
-    """
-    Simple relevance score:
-    - exact plain set number match
-    - exact full set_num match
-    - name startswith query
-    - name contains query
-    - theme contains query
-    """
-    q = q.strip().lower()
-    if not q:
-        return 0
 
-    name = (s.get("name") or "").lower()
-    theme = (s.get("theme") or "").lower()
-    set_num = (s.get("set_num") or "").lower()
-    plain = (s.get("set_num_plain") or "").lower()
+def _relevance_case(q_clean: str):
+    q_like = f"%{q_clean}%"
+    q_prefix = f"{q_clean}%"
 
-    score = 0
-    if plain and plain == q:
-        score += 100
-    if set_num and set_num == q:
-        score += 90
-    if name.startswith(q):
-        score += 60
-    if q in name:
-        score += 40
-    if q in theme:
-        score += 20
-
-    return score
+    return (
+        case((func.lower(_plain_expr()) == q_clean, 100), else_=0)
+        + case((func.lower(Set.set_num) == q_clean, 90), else_=0)
+        + case((func.lower(Set.name).like(q_prefix), 60), else_=0)
+        + case((func.lower(Set.name).like(q_like), 40), else_=0)
+        + case((func.lower(Set.theme).like(q_like), 20), else_=0)
+    )
 
 
-def _sort_key(sort: str):
-    """Return a key function for sorting. 'relevance' is handled separately."""
-    if sort == "name":
-        return lambda r: (r.get("name") or "").lower()
-    if sort == "year":
-        return lambda r: (r.get("year") or 0)
-    if sort == "pieces":
-        return lambda r: (r.get("pieces") or 0)
-    if sort == "rating":
-        return lambda r: (r.get("_avg_rating") or 0.0, r.get("_rating_count") or 0)
-    return lambda r: (r.get("name") or "").lower()
-
-
-# --------- main list endpoint: GET /sets ---------
 @router.get("")
 def list_sets(
     response: Response,
-    q: Optional[str] = Query(None, description="Search across name, theme, set number"),
-    page: int = Query(1, ge=1, description="Page number (1-based)"),
-    limit: int = Query(20, ge=1, le=100, description="Page size"),
-    sort: str = Query(
-        "relevance",
-        description="Sort by: relevance | name | year | pieces | rating",
-    ),
-    order: Optional[str] = Query(
-        None, description="asc | desc (optional; defaults chosen per sort)"
-    ),
+    db: Session = Depends(get_db),
+    q: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    sort: str = Query("relevance", description="relevance | name | year | pieces | rating"),
+    order: Optional[str] = Query(None, description="asc | desc"),
 ):
-    """
-    List sets from the local cache with search, sorting, pagination,
-    and rating summary (avg, count) if reviews exist.
-
-    Now with typo-friendly fallback:
-    - First try normal substring search (_matches_query)
-    - If that finds 0 results and q is provided, use _fuzzy_score_for_set
-      to return the closest matches instead.
-    """
-    all_sets = load_cached_sets()
-    sets = all_sets
-
-    # ---------- 1) NORMAL FILTER ----------
-    if q:
-        sets = [s for s in sets if _matches_query(s, q)]
-
-        # ---------- 2) FUZZY FALLBACK IF NO MATCHES ----------
-        if not sets:
-            scored: List[Tuple[float, Dict[str, Any]]] = []
-
-            for s in all_sets:
-                score = _fuzzy_score_for_set(s, q)
-                # tweak threshold as needed
-                if score >= 0.55:
-                    scored.append((score, s))
-
-            # sort best matches first
-            scored.sort(key=lambda t: t[0], reverse=True)
-
-            # e.g. keep top 100 fuzzy matches
-            sets = [s for score, s in scored[:100]]
-
-    # enrich with rating stats
-    enriched: List[Dict[str, Any]] = []
-    for s in sets:
-        avg, count = _rating_stats_for_set(s.get("set_num") or "")
-        s2 = dict(s)
-        s2["_avg_rating"] = avg
-        s2["_rating_count"] = count
-        enriched.append(s2)
-
-    # validate sort
     allowed_sorts = {"relevance", "name", "year", "pieces", "rating"}
     if sort not in allowed_sorts:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid sort '{sort}'. Allowed: {', '.join(sorted(allowed_sorts))}",
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid sort '{sort}'")
 
-    # default order:
-    # - relevance: desc
-    # - rating:   desc
-    # - others:   asc
-    if order is None:
-        if sort in {"relevance", "rating"}:
-            order = "desc"
-        else:
-            order = "asc"
-    reverse = (order == "desc")
-
-    # sorting
-    if sort == "relevance":
-        if q:
-            for r in enriched:
-                r["_relevance"] = _relevance_score(r, q)
-            enriched.sort(
-                key=lambda r: (
-                    r.get("_relevance") or 0,          # 1) textual relevance
-                    r.get("_rating_count") or 0,       # 2) popularity (more reviews)
-                    r.get("_avg_rating") or 0.0,       # 3) better-rated as tie-breaker
-                ),
-                reverse=True,
-            )
-        else:
-            # no query → just sort by name
-            enriched.sort(key=_sort_key("name"), reverse=False) 
-    else:
-        enriched.sort(key=_sort_key(sort), reverse=reverse)
-
-    # pagination
-    total = len(enriched)
-    start = (page - 1) * limit
-    end = start + limit
-    page_rows = enriched[start:end]
-
-    # strip synthetic keys from response
-    for r in page_rows:
-        r["rating_avg"] = r.pop("_avg_rating", 0.0)
-        r["rating_count"] = r.pop("_rating_count", 0)
-        r.pop("_relevance", None)
-
-    response.headers["X-Total-Count"] = str(total)
-    return page_rows
-
-def _popularity_boost(set_num: str) -> Tuple[float, int]:
-    """
-    Use existing rating stats as a 'popularity' signal.
-    Higher count → more popular. Average rating as tie-breaker.
-    """
-    avg, count = _rating_stats_for_set(set_num or "")
-    # simple scheme: each review adds 1 point, but cap at 50
-    # (so a set with 100 reviews doesn't dominate everything forever)
-    popularity_score = min(count, 50)
-    return popularity_score, count
-
-# --------- autocomplete endpoint: GET /sets/suggest ---------
-@router.get("/suggest")
-def suggest_sets(
-    q: str = Query(..., min_length=1, description="User's partial or fuzzy query"),
-    limit: int = Query(6, ge=1, le=20, description="Max suggestions to return"),
-):
-    """
-    Return fuzzy + popularity-aware suggestions for misspelled / partial queries.
-
-    Strategy:
-    1. Strongly prefer "direct" matches: name/theme/set_num containing or
-       starting with the query, or exact set number matches.
-    2. If not enough direct matches, fall back to fuzzy matches.
-    3. Among candidates, boost sets with more reviews so popular sets float up.
-    """
     q_clean = (q or "").strip().lower()
-    if not q_clean:
-        return []
+    if order is None:
+        order = "desc" if sort in {"relevance", "rating"} else "asc"
+    order = order.lower()
+    reverse = order == "desc"
 
-    all_sets = load_cached_sets()
-
-    candidates: List[Tuple[float, float, int, Dict[str, Any]]] = []
-
-    for s in all_sets:
-        name = (s.get("name") or "").lower()
-        theme = (s.get("theme") or "").lower()
-        set_num = (s.get("set_num") or "").lower()
-        plain = (s.get("set_num_plain") or "").lower()
-
-        base_score = 0.0
-        direct_match = False
-
-        # ---------- 1) DIRECT / SUBSTRING MATCHES ----------
-        if plain and plain == q_clean:
-            base_score += 120  # exact plain number match
-            direct_match = True
-
-        if set_num and set_num == q_clean:
-            base_score += 110  # exact full set_num match
-            direct_match = True
-
-        if name.startswith(q_clean):
-            base_score += 80   # name begins with query
-            direct_match = True
-
-        if q_clean in name:
-            base_score += 60   # query appears somewhere in name
-            direct_match = True
-
-        if q_clean in theme:
-            base_score += 30   # theme contains query
-            direct_match = True
-
-        # ---------- 2) FUZZY FALLBACK ----------
-        # Only run fuzzy scoring if we didn't get any strong direct signal
-        if not direct_match:
-            fuzzy = _fuzzy_score_for_set(s, q_clean)
-            # ignore very weak fuzzy matches
-            if fuzzy < 0.5:
-                continue
-            base_score += fuzzy * 50.0
-
-        # ---------- 3) POPULARITY BOOST ----------
-        pop_score, review_count = _popularity_boost(s.get("set_num") or "")
-        # add popularity to the overall score
-        total_score = base_score + pop_score
-
-        candidates.append((total_score, pop_score, review_count, s))
-
-    if not candidates:
-        return []
-
-    # ---------- 4) SORT BEST FIRST ----------
-    # Sort by:
-    #   1) total_score (relevance + popularity)
-    #   2) popularity (pop_score)
-    #   3) review_count
-    #   4) year (newer first)
-    candidates.sort(
-        key=lambda t: (
-            t[0],                      # total_score
-            t[1],                      # pop_score
-            t[2],                      # review_count
-            (t[3].get("year") or 0),   # year
-        ),
-        reverse=True,
+    rating_sq = (
+        select(
+            Review.set_num.label("set_num"),
+            func.avg(Review.rating).label("avg_rating"),
+            func.count(Review.rating).label("rating_count"),
+        )
+        .where(Review.rating.isnot(None))
+        .group_by(Review.set_num)
+        .subquery()
     )
 
-    top = [s for total, pop, count, s in candidates[:limit]]
+    stmt = (
+        select(
+            Set,
+            func.coalesce(rating_sq.c.avg_rating, 0.0).label("avg_rating"),
+            func.coalesce(rating_sq.c.rating_count, 0).label("rating_count"),
+        )
+        .outerjoin(rating_sq, rating_sq.c.set_num == Set.set_num)
+    )
 
-    # ---------- 5) LIGHTWEIGHT RESPONSE SHAPE ----------
-    # This is what your frontend expects: set_num, name, ip/theme, year.
-    return [
-        {
-            "set_num": s.get("set_num"),
-            "name": s.get("name"),
-            "ip": s.get("ip") or s.get("theme"),
-            "year": s.get("year"),
-        }
-        for s in top
-    ]
+    if q_clean:
+        like = f"%{q_clean}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(Set.name).like(like),
+                func.lower(Set.theme).like(like),
+                func.lower(Set.set_num).like(like),
+                func.lower(_plain_expr()) == q_clean,
+            )
+        )
 
-# --------- single set endpoint: GET /sets/{set_num} ---------
-@router.get("/{set_num}")
-def get_set(set_num: str):
-    """
-    Return a single set by set number (accepts '10305' or '10305-1').
-    Includes rating summary if reviews exist.
-    """
-    s = get_set_by_num(set_num)
-    if not s:
-        raise HTTPException(status_code=404, detail="Set not found")
+    # total count
+    count_stmt = select(func.count()).select_from(Set)
+    if q_clean:
+        like = f"%{q_clean}%"
+        count_stmt = count_stmt.where(
+            or_(
+                func.lower(Set.name).like(like),
+                func.lower(Set.theme).like(like),
+                func.lower(Set.set_num).like(like),
+                func.lower(_plain_expr()) == q_clean,
+            )
+        )
+    total = db.execute(count_stmt).scalar_one()
+    response.headers["X-Total-Count"] = str(total)
 
-    avg, count = _rating_stats_for_set(s.get("set_num") or "")
-    out = dict(s)
-    out["rating_avg"] = avg
-    out["rating_count"] = count
+    # sort
+    if sort == "relevance":
+        if q_clean:
+            score = _relevance_case(q_clean).label("_relevance")
+            stmt = stmt.order_by(
+                desc(score),
+                desc(func.coalesce(rating_sq.c.rating_count, 0)),
+                desc(func.coalesce(rating_sq.c.avg_rating, 0.0)),
+            )
+        else:
+            stmt = stmt.order_by(asc(func.lower(Set.name)))
+    elif sort == "name":
+        stmt = stmt.order_by(desc(func.lower(Set.name)) if reverse else asc(func.lower(Set.name)))
+    elif sort == "year":
+        stmt = stmt.order_by(desc(Set.year) if reverse else asc(Set.year))
+    elif sort == "pieces":
+        stmt = stmt.order_by(desc(Set.pieces) if reverse else asc(Set.pieces))
+    elif sort == "rating":
+        stmt = stmt.order_by(
+            desc(func.coalesce(rating_sq.c.avg_rating, 0.0)) if reverse else asc(func.coalesce(rating_sq.c.avg_rating, 0.0)),
+            desc(func.coalesce(rating_sq.c.rating_count, 0)) if reverse else asc(func.coalesce(rating_sq.c.rating_count, 0)),
+        )
+
+    offset = (page - 1) * limit
+    rows = db.execute(stmt.offset(offset).limit(limit)).all()
+
+    out: List[Dict[str, Any]] = []
+    for set_obj, avg_rating, rating_count in rows:
+        d = _model_to_dict(set_obj)
+        d["average_rating"] = float(avg_rating or 0.0)
+        d["rating_count"] = int(rating_count or 0)
+        d["rating_avg"] = d["average_rating"]  # alias for older frontend code
+        out.append(d)
+
     return out
 
 
-# --------- price offers endpoint: GET /sets/{set_num}/offers ---------
-@router.get("/{set_num}/offers", response_model=List[StoreOffer])
-def get_set_offers(set_num: str):
-    """
-    Return a list of store offers (price, currency, affiliate URL, stock)
-    for the given set. Uses the plain set number as the lookup key.
-    """
-    s = get_set_by_num(set_num)
+@router.get("/suggest")
+def suggest_sets(
+    db: Session = Depends(get_db),
+    q: str = Query(..., min_length=1),
+    limit: int = Query(6, ge=1, le=20),
+):
+    q_clean = (q or "").strip().lower()
+    like = f"%{q_clean}%"
+
+    # Candidate pool from direct matches (DB cheap)
+    candidates = db.execute(
+        select(Set).where(
+            or_(
+                func.lower(Set.name).like(like),
+                func.lower(Set.theme).like(like),
+                func.lower(Set.set_num).like(like),
+                func.lower(_plain_expr()) == q_clean,
+            )
+        ).limit(300)
+    ).scalars().all()
+
+    # Fuzzy rank in Python (small pool)
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for s in candidates:
+        d = _model_to_dict(s)
+
+        base = 0.0
+        name = (d.get("name") or "").lower()
+        theme = (d.get("theme") or "").lower()
+        set_num = (d.get("set_num") or "").lower()
+        plain = set_num.split("-")[0]
+
+        direct = False
+        if plain == q_clean:
+            base += 120; direct = True
+        if set_num == q_clean:
+            base += 110; direct = True
+        if name.startswith(q_clean):
+            base += 80; direct = True
+        if q_clean in name:
+            base += 60; direct = True
+        if q_clean in theme:
+            base += 30; direct = True
+
+        if not direct:
+            fz = _fuzzy_score(d, q_clean)
+            if fz < 0.5:
+                continue
+            base += fz * 50.0
+
+        # popularity = review count (capped)
+        cnt = db.execute(
+            select(func.count(Review.rating)).where(
+                Review.set_num == d["set_num"],
+                Review.rating.isnot(None),
+            )
+        ).scalar_one()
+        pop = min(int(cnt or 0), 50)
+
+        scored.append((base + pop, d))
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    top = [d for _, d in scored[:limit]]
+
+    # Frontend expects: set_num, name, ip/theme, year
+    return [
+        {"set_num": d.get("set_num"), "name": d.get("name"), "ip": d.get("theme"), "year": d.get("year")}
+        for d in top
+    ]
+
+
+@router.get("/{set_num}")
+def get_set(set_num: str, db: Session = Depends(get_db)):
+    raw = (set_num or "").strip()
+    plain = raw.split("-")[0].lower()
+
+    s = db.execute(
+        select(Set).where(
+            or_(
+                func.lower(Set.set_num) == raw.lower(),
+                func.lower(_plain_expr()) == plain,
+            )
+        ).limit(1)
+    ).scalar_one_or_none()
+
     if not s:
         raise HTTPException(status_code=404, detail="Set not found")
 
-    # Prefer the precomputed plain number; fall back to stripping suffix
-    plain = (s.get("set_num_plain") or "").strip() or s.get("set_num") or ""
-    plain = plain.split("-")[0]
+    avg, cnt = db.execute(
+        select(
+            func.coalesce(func.avg(Review.rating), 0.0),
+            func.coalesce(func.count(Review.rating), 0),
+        ).where(Review.set_num == s.set_num, Review.rating.isnot(None))
+    ).one()
 
-    offers = get_offers_for_set(plain)
-    return offers
+    out = _model_to_dict(s)
+    out["average_rating"] = float(avg or 0.0)
+    out["rating_count"] = int(cnt or 0)
+    out["rating_avg"] = out["average_rating"]
+    return out
+
+
+@router.get("/{set_num}/offers", response_model=List[StoreOffer])
+def get_set_offers(set_num: str, db: Session = Depends(get_db)):
+    raw = (set_num or "").strip()
+    plain = raw.split("-")[0].lower()
+
+    s = db.execute(
+        select(Set).where(
+            or_(
+                func.lower(Set.set_num) == raw.lower(),
+                func.lower(_plain_expr()) == plain,
+            )
+        ).limit(1)
+    ).scalar_one_or_none()
+
+    if not s:
+        raise HTTPException(status_code=404, detail="Set not found")
+
+    plain_num = (s.set_num or "").split("-")[0]
+    return get_offers_for_set(plain_num)
+
+@router.get("/trending")
+def trending_sets(
+    response: Response,
+    db: Session = Depends(get_db),
+    days: int = Query(30, ge=1, le=365),
+    limit: int = Query(12, ge=1, le=50),
+):
+    """
+    GET /sets/trending?days=30&limit=12
+
+    Trending = most reviews created in the last N days.
+    (ties broken by avg rating, then total rating_count)
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    recent_sq = (
+        select(
+            Review.set_num.label("set_num"),
+            func.count(Review.id).label("recent_reviews"),
+            func.avg(Review.rating).label("avg_rating"),
+            func.count(Review.rating).label("rating_count"),
+        )
+        .where(Review.created_at >= cutoff)
+        .group_by(Review.set_num)
+        .subquery()
+    )
+
+    stmt = (
+        select(
+            Set,
+            recent_sq.c.recent_reviews,
+            func.coalesce(recent_sq.c.avg_rating, 0.0).label("avg_rating"),
+            func.coalesce(recent_sq.c.rating_count, 0).label("rating_count"),
+        )
+        .join(recent_sq, recent_sq.c.set_num == Set.set_num)
+        .order_by(
+            desc(recent_sq.c.recent_reviews),
+            desc(func.coalesce(recent_sq.c.avg_rating, 0.0)),
+            desc(func.coalesce(recent_sq.c.rating_count, 0)),
+        )
+        .limit(limit)
+    )
+
+    rows = db.execute(stmt).all()
+    response.headers["X-Total-Count"] = str(len(rows))
+
+    out = []
+    for set_obj, recent_reviews, avg_rating, rating_count in rows:
+        d = _model_to_dict(set_obj)
+        d["recent_reviews"] = int(recent_reviews or 0)
+        d["average_rating"] = float(avg_rating or 0.0)
+        d["rating_count"] = int(rating_count or 0)
+        d["rating_avg"] = d["average_rating"]  # keep your frontend alias
+        out.append(d)
+
+    return out

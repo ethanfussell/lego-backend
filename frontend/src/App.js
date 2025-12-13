@@ -139,7 +139,19 @@ function HomePage({
         setFeaturedSets(items.slice(0, 8));
         setDealsSets(items.slice(8, 16));
         setRetiringSets(items.slice(16, 24));
-        setTrendingSets(items.slice(24, 32));
+        // Trending: last 30 days
+        try {
+          const trendingResp = await fetch(`${API_BASE}/sets/trending?days=30&limit=12`);
+          if (!trendingResp.ok) {
+            const text = await trendingResp.text();
+            throw new Error(`Trending failed (${trendingResp.status}): ${text}`);
+          }
+          const trendingData = await trendingResp.json();
+          setTrendingSets(Array.isArray(trendingData) ? trendingData : []);
+        } catch (e) {
+          console.error("Trending fetch failed, falling back:", e);
+          setTrendingSets(items.slice(24, 32)); // fallback so home doesn't look empty
+        }
       } catch (err) {
         if (!cancelled) {
           console.error("Error loading home sets:", err);
@@ -246,6 +258,14 @@ function App() {
   const [token, setToken] = useState(() => {
     return localStorage.getItem("lego_token") || "";
   });
+
+  useEffect(() => {
+    const existing = localStorage.getItem("lego_token");
+    if (!existing) {
+      localStorage.setItem("lego_token", "dev-ethan");
+      setToken("dev-ethan");
+    }
+  }, []);
 
   // Search bar + suggestions
   const [searchText, setSearchText] = useState("");
@@ -696,6 +716,13 @@ function App() {
 
         if (!resp.ok && resp.status !== 409) {
           const text = await resp.text();
+        
+          // backend sometimes returns 400 {"detail":"Already owned"} — treat as OK
+          if (resp.status === 400 && text.includes("Already owned")) {
+            await loadCollections(token);
+            return;
+          }
+        
           throw new Error(`Failed to mark owned (${resp.status}): ${text}`);
         }
       }

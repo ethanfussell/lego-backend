@@ -11,6 +11,9 @@ Handles fetching LEGO sets from the Rebrickable API and caching them locally.
 
 from ..core.env import get_env
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 from typing import Any, Dict, List, Optional
 
 import json

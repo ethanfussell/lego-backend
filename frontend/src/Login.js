@@ -11,21 +11,19 @@ function Login({ onLoginSuccess }) {
 
   async function handleSubmit(e) {
     e.preventDefault();
+    if (loading) return;
+
     setLoading(true);
     setError("");
 
     try {
-      // 🔑 Backend expects form data (OAuth2PasswordRequestForm),
-      // NOT JSON.
       const body = new URLSearchParams();
-      body.append("username", username);
-      body.append("password", password);
+      body.set("username", username);
+      body.set("password", password);
 
       const resp = await fetch(`${API_BASE}/auth/login`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body,
       });
 
@@ -35,15 +33,18 @@ function Login({ onLoginSuccess }) {
       }
 
       const data = await resp.json(); // { access_token, token_type }
+      const accessToken = data?.access_token;
 
-      if (onLoginSuccess) {
-        onLoginSuccess(data.access_token);
+      if (!accessToken) {
+        throw new Error("Login succeeded but no access_token was returned.");
       }
 
-      console.log("✅ Logged in, token:", data.access_token);
+      if (typeof onLoginSuccess === "function") {
+        onLoginSuccess(accessToken);
+      }
     } catch (err) {
       console.error("Login error:", err);
-      setError(err.message || String(err));
+      setError(err?.message || String(err));
     } finally {
       setLoading(false);
     }
@@ -61,15 +62,14 @@ function Login({ onLoginSuccess }) {
       }}
     >
       <div style={{ marginBottom: "0.75rem" }}>
-        <label
-          style={{ display: "block", marginBottom: "0.25rem", fontWeight: 500 }}
-        >
+        <label style={{ display: "block", marginBottom: "0.25rem", fontWeight: 500 }}>
           Username
         </label>
         <input
           type="text"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
+          autoComplete="username"
           style={{
             width: "100%",
             padding: "0.5rem",
@@ -80,15 +80,14 @@ function Login({ onLoginSuccess }) {
       </div>
 
       <div style={{ marginBottom: "0.75rem" }}>
-        <label
-          style={{ display: "block", marginBottom: "0.25rem", fontWeight: 500 }}
-        >
+        <label style={{ display: "block", marginBottom: "0.25rem", fontWeight: 500 }}>
           Password
         </label>
         <input
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
+          autoComplete="current-password"
           style={{
             width: "100%",
             padding: "0.5rem",
@@ -98,11 +97,7 @@ function Login({ onLoginSuccess }) {
         />
       </div>
 
-      {error && (
-        <p style={{ color: "red", marginBottom: "0.5rem" }}>
-          {error}
-        </p>
-      )}
+      {error && <p style={{ color: "red", marginBottom: "0.5rem" }}>{error}</p>}
 
       <button
         type="submit"

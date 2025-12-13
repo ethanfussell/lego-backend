@@ -1,98 +1,92 @@
-# app/core/auth.py
+# backend/app/core/auth.py
+from __future__ import annotations
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
+import bcrypt
+
+from sqlalchemy.orm import Session
+
+from ..db import get_db
+from ..models import User as UserModel
 
 router = APIRouter()
 
-# ----------------- Models -----------------
+# This must match your login route path below
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+
+# ----------------- Response models -----------------
 class User(BaseModel):
+    id: int
     username: str
-    full_name: str
+
 
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
 
-# ----------------- Fake DB -----------------
-# 👇 MUST match what the tests are using:
-# LOGIN ATTEMPT: ethan lego123
-FAKE_USERS_DB = {
-    "ethan": {
-        "username": "ethan",
-        "full_name": "Ethan Fussell",
-        "password": "lego123",
-    }
-}
+# ----------------- Helpers -----------------
+def verify_password(password: str, password_hash: str | None) -> bool:
+    if not password_hash:
+        return False
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except ValueError:
+        return False
 
 
-# ----------------- OAuth2 setup -----------------
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
-def authenticate_user(username: str, password: str) -> User | None:
-    """
-    Look up the user in the fake DB and check the password.
-    Return a User or None.
-    """
-    user_data = FAKE_USERS_DB.get(username)
-    if not user_data:
-        return None
-    if password != user_data["password"]:
-        return None
-    return User(username=user_data["username"], full_name=user_data["full_name"])
+def get_user_by_username(db: Session, username: str) -> UserModel | None:
+    return db.query(UserModel).filter(UserModel.username == username).first()
 
 
-def create_access_token(username: str) -> str:
-    """
-    Super fake token generator – just makes a string the tests will recognize.
-    """
-    return f"fake-token-for-{username}"
-
-
+# ----------------- Routes -----------------
 @router.post("/auth/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    # debug log so you can see what tests send
-    print("LOGIN ATTEMPT:", form_data.username, form_data.password)
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    user = get_user_by_username(db, form_data.username)
 
-    user = authenticate_user(form_data.username, form_data.password)
-    if not user:
+    if not user or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
         )
 
-    token = create_access_token(user.username)
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-    }
+    # simple dev token for now
+    return {"access_token": f"dev-{user.username}", "token_type": "bearer"}
 
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
-    """
-    Very fake token check: token should look like 'fake-token-for-<username>'.
-    We'll also accept the raw username to keep it flexible.
-    """
-    if token.startswith("fake-token-for-"):
-        username = token.removeprefix("fake-token-for-")
-    else:
-        username = token
+def _username_from_token(token: str) -> str:
+    # accept either "dev-ethan" or just "ethan"
+    if token.startswith("dev-"):
+        return token[4:]
+    return token
 
-    user_data = FAKE_USERS_DB.get(username)
-    if not user_data:
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> UserModel:
+    username = _username_from_token(token)
+    user = get_user_by_username(db, username)
+
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return User(username=user_data["username"], full_name=user_data["full_name"])
+    return user
 
 
 @router.get("/auth/me", response_model=User)
-async def read_me(current_user: User = Depends(get_current_user)):
-    """
-    Return the current user based on the bearer token.
-    """
-    return current_user
+def read_me(current_user: UserModel = Depends(get_current_user)):
+    return {"id": int(current_user.id), "username": current_user.username}

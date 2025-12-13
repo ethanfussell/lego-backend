@@ -3,7 +3,10 @@ from datetime import datetime
 from typing import List, Optional
 
 from pydantic import BaseModel, validator
+from pydantic import ConfigDict
 
+class Review(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
 
 class ActorPayload(BaseModel):
     """
@@ -22,9 +25,6 @@ class Review(BaseModel):
     created_at: datetime
     likes_count: int = 0
     liked_by: List[str] = []
-
-    class Config:
-        orm_mode = True
 
 
 class ReviewCreate(BaseModel):

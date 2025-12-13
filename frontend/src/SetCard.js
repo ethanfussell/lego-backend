@@ -8,7 +8,7 @@ function SetCard({
   isInWishlist = false,
   onMarkOwned,
   onAddWishlist,
-  variant = "default", // "default" | "sale" | "collection" (future)
+  variant = "default", // "default" | "sale" | "collection"
   userRating,
 }) {
   const navigate = useNavigate();
@@ -63,16 +63,19 @@ function SetCard({
 
   function handleOwnedClick(e) {
     e.stopPropagation();
-    if (typeof onMarkOwned === "function") {
-      onMarkOwned(set_num);
-    }
+    if (typeof onMarkOwned === "function") onMarkOwned(set_num);
   }
 
   function handleWishlistClick(e) {
     e.stopPropagation();
-    if (typeof onAddWishlist === "function") {
-      onAddWishlist(set_num);
-    }
+    if (typeof onAddWishlist === "function") onAddWishlist(set_num);
+  }
+
+  function handleViewDealsClick(e) {
+    e.stopPropagation();
+    if (!set_num) return;
+    // For now: go to set detail. Later: navigate to a deals page.
+    navigate(`/sets/${encodeURIComponent(set_num)}`);
   }
 
   return (
@@ -81,7 +84,7 @@ function SetCard({
       style={{
         width: "100%",
         maxWidth: "260px",
-        minHeight: "360px", // 👈 cards all at least this tall
+        minHeight: "360px",
         borderRadius: "12px",
         border: "1px solid #e5e7eb",
         background: "white",
@@ -90,18 +93,16 @@ function SetCard({
         flexDirection: "column",
         cursor: "pointer",
         transition: "transform 0.1s ease, box-shadow 0.1s ease",
-        overflow: "hidden", // nothing escapes the card
+        overflow: "hidden",
         boxSizing: "border-box",
       }}
       onMouseEnter={(e) => {
         e.currentTarget.style.transform = "translateY(-2px)";
-        e.currentTarget.style.boxShadow =
-          "0 6px 16px rgba(15,23,42,0.12)";
+        e.currentTarget.style.boxShadow = "0 6px 16px rgba(15,23,42,0.12)";
       }}
       onMouseLeave={(e) => {
         e.currentTarget.style.transform = "none";
-        e.currentTarget.style.boxShadow =
-          "0 1px 2px rgba(15,23,42,0.04)";
+        e.currentTarget.style.boxShadow = "0 1px 2px rgba(15,23,42,0.04)";
       }}
     >
       {/* IMAGE AREA */}
@@ -124,7 +125,7 @@ function SetCard({
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            height: "200px", // 👈 fixed photo-frame height
+            height: "200px",
             boxSizing: "border-box",
             overflow: "hidden",
           }}
@@ -186,6 +187,7 @@ function SetCard({
           >
             {name || "Unknown set"}
           </div>
+
           <div
             style={{
               fontSize: "0.8rem",
@@ -245,7 +247,7 @@ function SetCard({
           </div>
         )}
 
-        {/* Price line (used on Sale but harmless elsewhere) */}
+        {/* Price line (mainly for sale, harmless elsewhere) */}
         {priceFrom !== null && (
           <div
             style={{
@@ -278,13 +280,7 @@ function SetCard({
             }}
           >
             <span style={{ color: "#6b7280" }}>Your rating</span>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "0.25rem",
-              }}
-            >
+            <div style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
               <span style={{ fontSize: "0.95rem", color: "#f59e0b" }}>★</span>
               <span>
                 {effectiveUserRating !== null
@@ -295,16 +291,86 @@ function SetCard({
               </span>
             </div>
           </div>
-        ) : (
-          // default & sale both use the same two buttons for now
+        ) : variant === "sale" ? (
+          // SALE: Shop deals + two pills
           <div
             style={{
               borderTop: "1px solid #f3f4f6",
               marginTop: "0.4rem",
               paddingTop: "0.4rem",
               display: "flex",
-              flexWrap: "wrap",
+              flexDirection: "column",
               gap: "0.35rem",
+            }}
+          >
+            <button
+              type="button"
+              onClick={handleViewDealsClick}
+              style={{
+                width: "100%",
+                padding: "0.45rem 0.6rem",
+                borderRadius: "10px",
+                border: "1px solid #d1d5db",
+                background: "#111827",
+                color: "white",
+                fontSize: "0.85rem",
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+            >
+              Shop deals
+            </button>
+
+            <div style={{ display: "flex", gap: "0.35rem" }}>
+              <button
+                type="button"
+                onClick={handleOwnedClick}
+                style={{
+                  flex: "1 1 0",
+                  padding: "0.35rem 0.5rem",
+                  borderRadius: "999px",
+                  border: isOwned ? "none" : "1px solid #d1d5db",
+                  backgroundColor: isOwned ? "#16a34a" : "#f9fafb",
+                  color: isOwned ? "white" : "#111827",
+                  fontSize: "0.8rem",
+                  fontWeight: 500,
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {isOwned ? "Owned ✓" : "Mark owned"}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleWishlistClick}
+                style={{
+                  flex: "1 1 0",
+                  padding: "0.35rem 0.5rem",
+                  borderRadius: "999px",
+                  border: isInWishlist ? "none" : "1px solid #d1d5db",
+                  backgroundColor: isInWishlist ? "#a855f7" : "#f9fafb",
+                  color: isInWishlist ? "white" : "#111827",
+                  fontSize: "0.8rem",
+                  fontWeight: 500,
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {isInWishlist ? "In wishlist ★" : "Wishlist"}
+              </button>
+            </div>
+          </div>
+        ) : (
+          // DEFAULT: two pills only
+          <div
+            style={{
+              borderTop: "1px solid #f3f4f6",
+              marginTop: "0.4rem",
+              paddingTop: "0.4rem",
+              display: "flex",
+              gap: "0.35rem",
+              flexWrap: "wrap",
             }}
           >
             <button
